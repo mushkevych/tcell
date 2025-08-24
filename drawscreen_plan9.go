@@ -148,13 +148,13 @@ func (s *drawScreen) Clear() {
 	s.fillRect(s.winRect(), s.colorOf(bg))
 }
 
-func (s *drawScreen) Fill(r rune, comb []rune, style Style) {
+func (s *drawScreen) Fill(r rune, style Style) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for y := 0; y < s.height; y++ {
 		for x := 0; x < s.width; x++ {
-			s.setCellLocked(x, y, r, comb, style, true)
+			s.setCellLocked(x, y, r, nil, style, true)
 		}
 	}
 }
@@ -239,26 +239,35 @@ func (s *drawScreen) HasMouse() bool { return true }
 func (s *drawScreen) EnablePaste()  { s.pasteEnabled = true }
 func (s *drawScreen) DisablePaste() { s.pasteEnabled = false }
 
-func (s *drawScreen) SetClipboard(text string) error {
-	if !s.pasteEnabled {
-		return errors.New("paste/clipboard disabled")
+func (s *drawScreen) SetClipboard(data []byte) {
+	if !s.pasteEnabled || s.d == nil {
+		return
 	}
-	return s.d.WriteSnarf([]byte(text))
+	// Best-effort per tcell contract (no return). Ignore error.
+	_ = s.d.WriteSnarf(data)
 }
 
-func (s *drawScreen) GetClipboard() (string, error) {
-	if !s.pasteEnabled {
-		return "", errors.New("paste/clipboard disabled")
+func (s *drawScreen) GetClipboard() {
+	if !s.pasteEnabled || s.d == nil {
+		return
 	}
+	if txt, err := s.readClipboard(); err == nil && len(txt) > 0 {
+		// tcell >= v2.8 uses EventClipboard for GetClipboard responses.
+		s.PostEvent(NewEventClipboard([]byte(txt)))
+	}
+}
 
-	// First try with a modest buffer
-	buf := make([]byte, 8<<10) // 8 KiB
+// readClipboard returns the clipboard text synchronously (Plan 9 snarf).
+func (s *drawScreen) readClipboard() (string, error) {
+	if !s.pasteEnabled || s.d == nil {
+		return "", nil
+	}
+	buf := make([]byte, 8<<10)
 	n, actual, err := s.d.ReadSnarf(buf)
 	if err != nil {
 		return "", err
 	}
 	if actual > n {
-		// Grow to the actual size and read again
 		buf = make([]byte, actual)
 		n, _, err = s.d.ReadSnarf(buf)
 		if err != nil {
@@ -342,8 +351,20 @@ func (s *drawScreen) PollEvent() Event {
 	}
 }
 
-func (s *drawScreen) PostEvent(ev Event)          { s.evq <- ev }
-func (s *drawScreen) PostEventWait(ev Event) bool { s.evq <- ev; return true }
+func (s *drawScreen) PostEvent(ev Event) error {
+	// Non-blocking: report if the queue is full.
+	select {
+	case s.evq <- ev:
+		return nil
+	default:
+		return errors.New("tcell: event queue full")
+	}
+}
+
+func (s *drawScreen) PostEventWait(ev Event) {
+	// Blocking: guarantee delivery.
+	s.evq <- ev
+}
 
 // ---- Rendering -------------------------------------------------------------
 
@@ -417,8 +438,17 @@ func (s *drawScreen) translateKey(r rune) Event {
 
 	// Quick path: ASCII ^V (0x16) -> paste when enabled.
 	if s.pasteEnabled && r == 0x16 { // Ctrl+V
-		if txt, err := s.GetClipboard(); err == nil && len(txt) > 0 {
-			return NewEventPaste([]byte(txt)) // if your tcell needs string: NewEventPaste(txt)
+		if txt, err := s.readClipboard(); err == nil && len(txt) > 0 {
+			// Bracketed paste: return Start now, queue content and End asynchronously.
+			go func(copy string) {
+				for _, rr := range []rune(copy) {
+					// deliver pasted text as normal rune key events
+					s.PostEventWait(NewEventKey(KeyRune, rr, ModNone))
+				}
+				// signal paste end
+				s.PostEventWait(NewEventPaste(false))
+			}(txt)
+			return NewEventPaste(true)
 		}
 		// fall through to regular ^V if snarf empty or error
 	}
@@ -446,8 +476,15 @@ func (s *drawScreen) translateKey(r rune) Event {
 
 		// Paste via Shift+Insert (rio/devdraw convention)
 		if s.pasteEnabled && code == 0x0D && (mods&ModShift) != 0 { // Insert + Shift
-			if txt, err := s.GetClipboard(); err == nil && len(txt) > 0 {
-				return NewEventPaste([]byte(txt)) // if needed: NewEventPaste(txt)
+			if txt, err := s.readClipboard(); err == nil && len(txt) > 0 {
+				// Bracketed paste: Start now, queue content + End in the background.
+				go func(copy string) {
+					for _, rr := range []rune(copy) {
+						s.PostEventWait(NewEventKey(KeyRune, rr, ModNone))
+					}
+					s.PostEventWait(NewEventPaste(false))
+				}(txt)
+				return NewEventPaste(true)
 			}
 			// if empty, continue and return a normal Insert+Shift event
 		}
@@ -726,6 +763,8 @@ func max(a, b int) int {
 	return b
 }
 
+// --- tcell interfaces satisfied ---
+
 func (s *drawScreen) Beep() error {
 	// Optional: write BEL to the focused window, or use /dev/audio.
 	// For now, a no-op keeps the interface satisfied.
@@ -735,7 +774,6 @@ func (s *drawScreen) Beep() error {
 // Optional capability: return the time when the screen backend was ready.
 func (s *drawScreen) Context() interface{} { return struct{ When time.Time }{When: time.Now()} }
 
-// --- tcell interfaces satisfied ---
 // CanDisplay reports whether the backend can render the rune directly.
 // If checkFallback is true, return true for runes we can approximate (e.g., by
 // showing a placeholder). Here we approximate based on cell width.
@@ -787,6 +825,107 @@ func (s *drawScreen) DisableFocus() {
 // Plan 9 libdraw does not support focus in/out events, so this is a no-op.
 func (s *drawScreen) EnableFocus() {
 	// nothing to do
+}
+
+// HasKey reports whether this backend can generate the given special key.
+func (s *drawScreen) HasKey(k Key) bool {
+	// We translate these in translateKey(), so report support.
+	switch k {
+	case KeyRune, KeyEnter, KeyTab, KeyEscape,
+		KeyBackspace, KeyBackspace2,
+		KeyUp, KeyDown, KeyLeft, KeyRight,
+		KeyHome, KeyEnd, KeyPgUp, KeyPgDn,
+		KeyInsert, KeyDelete:
+		return true
+	}
+	// Function keys F1..F12 (mapped from the 0xF000 range).
+	if k >= KeyF1 && k <= KeyF12 {
+		return true
+	}
+	// Conservatively say no for everything else.
+	return false
+}
+
+func (s *drawScreen) SetCell(x, y int, style Style, ch ...rune) {
+	var main rune
+	var comb []rune
+
+	if len(ch) > 0 {
+		main = ch[0]
+		if len(ch) > 1 {
+			// keep subsequent runes as combining marks (even if a stray printable slips in)
+			comb = make([]rune, len(ch)-1)
+			copy(comb, ch[1:])
+		}
+	} else {
+		// no runes => clear cell (paint bg only)
+		main = 0
+	}
+
+	s.SetContent(x, y, main, comb, style)
+}
+
+func (s *drawScreen) SetCursorStyle(style CursorStyle, color ...Color) {
+	// Plan 9 devdraw doesn't expose cursor styling. Treat as a no-op.
+	// Keep current visibility and, if visible, keep cursor positioned at (cx,cy).
+	s.mu.Lock()
+	cx, cy, visible := s.cx, s.cy, s.cursorVisible
+	s.mu.Unlock()
+	if visible {
+		s.ShowCursor(cx, cy)
+	}
+}
+
+// HasPendingEvent reports whether a tcell Event is already queued.
+func (s *drawScreen) HasPendingEvent() bool {
+	// We maintain a buffered event queue (s.evq). If anything is already
+	// posted (via PostEvent/async paste/etc.), report true.
+	return len(s.evq) > 0
+}
+
+func (s *drawScreen) RegisterRuneFallback(r rune, subst string) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (s *drawScreen) UnregisterRuneFallback(r rune) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (s *drawScreen) Resize(i int, i2 int, i3 int, i4 int) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (s *drawScreen) Suspend() error {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (s *drawScreen) Resume() error {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (s *drawScreen) SetSize(i int, i2 int) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (s *drawScreen) LockRegion(x, y, width, height int, lock bool) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (s *drawScreen) Tty() (Tty, bool) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (s *drawScreen) SetTitle(s2 string) {
+	//TODO implement me
+	panic("implement me")
 }
 
 var _ Screen = (*drawScreen)(nil)
