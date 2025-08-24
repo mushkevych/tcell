@@ -3,6 +3,7 @@ module github.com/gdamore/tcell/v2
 go 1.23.0
 
 require (
+	9fans.net/go v0.0.7
 	github.com/gdamore/encoding v1.0.1
 	github.com/lucasb-eyer/go-colorful v1.2.0
 	github.com/mattn/go-runewidth v0.0.16
@@ -12,3 +13,5 @@ require (
 )
 
 require github.com/rivo/uniseg v0.4.3 // indirect
+
+replace 9fans.net/go => github.com/mushkevych/9fans-go v0.0.0-20250824042050-0f7d5fe5414d
