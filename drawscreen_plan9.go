@@ -62,6 +62,8 @@ type drawScreen struct {
 	pasteEnabled bool
 
 	mu sync.Mutex
+
+	runeFallback map[rune]string
 }
 
 // ---- Lifecycle -------------------------------------------------------------
@@ -884,48 +886,79 @@ func (s *drawScreen) HasPendingEvent() bool {
 }
 
 func (s *drawScreen) RegisterRuneFallback(r rune, subst string) {
-	//TODO implement me
-	panic("implement me")
+	s.mu.Lock()
+	if s.runeFallback == nil {
+		s.runeFallback = make(map[rune]string)
+	}
+	if subst == "" {
+		delete(s.runeFallback, r)
+	} else {
+		s.runeFallback[r] = subst
+	}
+	s.mu.Unlock()
 }
 
 func (s *drawScreen) UnregisterRuneFallback(r rune) {
-	//TODO implement me
-	panic("implement me")
+	s.mu.Lock()
+	if s.runeFallback != nil {
+		delete(s.runeFallback, r)
+	}
+	s.mu.Unlock()
 }
 
-func (s *drawScreen) Resize(i int, i2 int, i3 int, i4 int) {
-	//TODO implement me
-	panic("implement me")
+func (s *drawScreen) Suspend() error { return nil }
+func (s *drawScreen) Resume() error  { return nil }
+
+func (s *drawScreen) Resize(x, y, w, h int) {
+	if s == nil || s.d == nil || s.screen == nil {
+		return
+	}
+	if w < 1 || h < 1 {
+		return
+	}
+	// Convert cell size to pixels, keep current window origin.
+	min := s.screen.R.Min
+	max := image.Pt(min.X+w*s.cellW, min.Y+h*s.cellH)
+	r := draw.Rpt(draw.Pt(min.X, min.Y), draw.Pt(max.X, max.Y))
+	s.d.Resize(r) // Some servers may ignore; safe to try.
+
+	// Update bookkeeping and repaint.
+	s.mu.Lock()
+	s.recomputeGrid()
+	s.mu.Unlock()
+	s.Show()
 }
 
-func (s *drawScreen) Suspend() error {
-	//TODO implement me
-	panic("implement me")
-}
+// SetSize(w, h) in cells.
+func (s *drawScreen) SetSize(w, h int) {
+	if s == nil || s.d == nil || s.screen == nil {
+		return
+	}
+	if w < 1 || h < 1 {
+		return
+	}
+	min := s.screen.R.Min
+	max := image.Pt(min.X+w*s.cellW, min.Y+h*s.cellH)
+	r := draw.Rpt(draw.Pt(min.X, min.Y), draw.Pt(max.X, max.Y))
+	s.d.Resize(r)
 
-func (s *drawScreen) Resume() error {
-	//TODO implement me
-	panic("implement me")
-}
-
-func (s *drawScreen) SetSize(i int, i2 int) {
-	//TODO implement me
-	panic("implement me")
+	s.mu.Lock()
+	s.recomputeGrid()
+	s.mu.Unlock()
+	s.Show()
 }
 
 func (s *drawScreen) LockRegion(x, y, width, height int, lock bool) {
-	//TODO implement me
-	panic("implement me")
+	// Not needed with full-frame repaint; add if you introduce dirty-region updates.
 }
 
-func (s *drawScreen) Tty() (Tty, bool) {
-	//TODO implement me
-	panic("implement me")
-}
+func (s *drawScreen) Tty() (Tty, bool) { return nil, false }
 
-func (s *drawScreen) SetTitle(s2 string) {
-	//TODO implement me
-	panic("implement me")
+func (s *drawScreen) SetTitle(title string) {
+	if s == nil || s.d == nil {
+		return
+	}
+	s.d.SetLabel(title)
 }
 
 var _ Screen = (*drawScreen)(nil)
