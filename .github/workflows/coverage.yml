@@ -9,7 +9,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     steps:
       - name: Check out code into the Go module directory
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -27,7 +27,7 @@ jobs:
         run: go test -coverpkg="github.com/gdamore/tcell/v2/..." -covermode=count -coverprofile="coverage.txt" ./...
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5.4.2
+        uses: codecov/codecov-action@v5.4.3
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.txt
