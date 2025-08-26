@@ -14,6 +14,7 @@
 
 package tcell
 
+import "runtime"
 import "sync"
 
 // Screen represents the physical (or emulated) screen.
@@ -288,6 +289,12 @@ type Screen interface {
 // NewScreen returns a default Screen suitable for the user's terminal
 // environment.
 func NewScreen() (Screen, error) {
+	if runtime.GOOS == "plan9" {
+		if s, err := NewPlan9Screen(); err == nil {
+			return s, nil
+		}
+	}
+
 	// Windows is happier if we try for a console screen first.
 	if s, _ := NewConsoleScreen(); s != nil {
 		return s, nil

@@ -66,6 +66,11 @@ type drawScreen struct {
 	runeFallback map[rune]string
 }
 
+const (
+	eventQueueSize = 256
+	colorCacheHint = 64 // initial hint; map grows as needed
+)
+
 // ---- Lifecycle -------------------------------------------------------------
 
 // newDrawScreen returns a Screen backed by Plan 9 draw(3).
@@ -91,8 +96,8 @@ func (s *drawScreen) Init() error {
 	s.kbd = d.InitKeyboard()
 	s.mou = d.InitMouse()
 
-	s.colorCache = make(map[uint32]*draw.Image, 64)
-	s.evq = make(chan Event, 64)
+	s.evq = make(chan Event, eventQueueSize)
+	s.colorCache = make(map[uint32]*draw.Image, colorCacheHint)
 
 	// Measure cell metrics using the default font.
 	s.cellH = s.font.Height
@@ -344,7 +349,7 @@ func (s *drawScreen) PollEvent() Event {
 			for _, img := range s.colorCache {
 				_ = img.Free()
 			}
-			s.colorCache = make(map[uint32]*draw.Image, 64)
+			s.colorCache = make(map[uint32]*draw.Image, colorCacheHint)
 			s.recomputeGrid()
 			s.mu.Unlock()
 			s.evq <- NewEventResize(s.width, s.height)
@@ -371,19 +376,10 @@ func (s *drawScreen) PostEventWait(ev Event) {
 // ---- Rendering -------------------------------------------------------------
 
 func (s *drawScreen) drawCell(x, y int, c cell) {
-	// Compute target rect; expand to two cells if the rune is wide and we have space.
+	// Target rect for this cell (may be widened below for double-width glyphs).
 	r := s.cellRect(x, y)
-	w := wcwidth(c.currMain)
-	if w == 2 {
-		if x+1 < s.width {
-			r.Max.X += s.cellW
-		} else {
-			// If wide at last column, render as narrow (truncate visually) to avoid painting out of bounds.
-			w = 1
-		}
-	}
 
-	// Style & attributes (handle reverse here).
+	// Resolve style (handle reverse).
 	fg, bg, attr := c.currStyle.Decompose()
 	if attr&AttrReverse != 0 {
 		fg, bg = bg, fg
@@ -393,22 +389,54 @@ func (s *drawScreen) drawCell(x, y int, c cell) {
 	// Paint background across the (possibly widened) rect.
 	s.fillRect(r, s.colorOf(bg))
 
-	// If there's nothing to draw on top, we're done.
-	if c.currMain == 0 && len(c.currComb) == 0 {
+	// If this is the trailing half of a wide glyph, we're done (bg only).
+	if c.lock {
 		return
 	}
 
-	// Choose foreground paint.
+	// Compute width to decide whether to widen the paint rect.
+	w := c.width
+	if w != 1 && w != 2 {
+		w = wcwidth(c.currMain)
+		if w != 1 && w != 2 {
+			w = 1
+		}
+	}
+	if w == 2 {
+		if x+1 < s.width {
+			r.Max.X += s.cellW
+		} else {
+			// At last column, avoid writing past edge.
+			w = 1
+		}
+	}
+
+	// Foreground paint.
 	src := s.colorOf(fg)
 
-	// Build rune slice: base + combining marks. If base is empty, use space to carry marks.
-	rs := make([]rune, 0, 1+len(c.currComb))
+	// Build the rune slice to draw.
 	base := c.currMain
 	if base == 0 && len(c.currComb) > 0 {
-		// No base; draw combining marks over a space so they have a baseline.
+		// Use a space to carry combining marks when base is empty.
 		base = ' '
 	}
-	// If base is a space and there are no combining marks, we would have returned above.
+
+	// Optional glyph fallback substitution.
+	if s.runeFallback != nil {
+		if sub := s.runeFallback[base]; sub != "" {
+			rs := []rune(sub)
+			pt := draw.Pt(r.Min.X, r.Min.Y+s.font.Ascent)
+			s.screen.RunesBg(pt, src, image.Point{}, s.font, rs, s.colorOf(bg), image.Point{})
+			if attr&AttrUnderline != 0 {
+				yline := r.Max.Y - 1
+				s.screen.Line(draw.Pt(r.Min.X, yline), draw.Pt(r.Max.X, yline), 0, 0, 0, src, image.Point{})
+			}
+			return
+		}
+	}
+
+	// Base + combining marks.
+	rs := make([]rune, 0, 1+len(c.currComb))
 	rs = append(rs, base)
 	if len(c.currComb) > 0 {
 		rs = append(rs, c.currComb...)
@@ -418,13 +446,13 @@ func (s *drawScreen) drawCell(x, y int, c cell) {
 	pt := draw.Pt(r.Min.X, r.Min.Y+s.font.Ascent)
 	s.screen.RunesBg(pt, src, image.Point{}, s.font, rs, s.colorOf(bg), image.Point{})
 
-	// Optional polish: underline (1px) when requested.
+	// Optional underline (1px).
 	if attr&AttrUnderline != 0 {
 		yline := r.Max.Y - 1
 		s.screen.Line(draw.Pt(r.Min.X, yline), draw.Pt(r.Max.X, yline), 0, 0, 0, src, image.Point{})
 	}
 
-	// mark as drawn
+	// Mark leading cell as drawn (keep last* in sync for potential incremental paints).
 	idx := y*s.width + x
 	cur := s.cells[idx]
 	cur.lastMain = cur.currMain
@@ -633,15 +661,67 @@ func (s *drawScreen) setCellLocked(x, y int, mainc rune, comb []rune, style Styl
 	}
 	i := y*s.width + x
 	old := s.cells[i]
-	newc := cell{currMain: mainc, currComb: cloneRunes(comb), currStyle: style}
 
-	if old.currMain == newc.currMain && old.currStyle == newc.currStyle && runesEqual(old.currComb, newc.currComb) {
+	// Compute intended width (clamp at right edge).
+	w := wcwidth(mainc)
+	if w != 2 || x+1 >= s.width {
+		w = 1
+	}
+
+	// Build leading cell.
+	newLead := old
+	newLead.currMain = mainc
+	newLead.currComb = cloneRunes(comb)
+	newLead.currStyle = style
+	newLead.width = w
+	newLead.lock = false
+
+	// Early-out if nothing changed (including width/lock).
+	if old.currMain == newLead.currMain &&
+		old.currStyle == newLead.currStyle &&
+		newLead.width == old.width &&
+		!old.lock &&
+		runesEqual(old.currComb, newLead.currComb) {
 		return
 	}
 
-	s.cells[i] = newc
+	s.cells[i] = newLead
+
+	// Manage trailing cell for wide glyphs.
+	if w == 2 {
+		j := i + 1
+		trail := s.cells[j]
+		trail.currMain = 0
+		trail.currComb = nil
+		trail.currStyle = style // arbitrary; not drawn
+		trail.width = 0
+		trail.lock = true
+		s.cells[j] = trail
+
+		if !deferDraw {
+			s.drawCell(x, y, newLead) // paint lead (possibly widened)
+			s.drawCell(x+1, y, trail) // ensure trailing bg is painted
+		}
+		return
+	}
+
+	// If the previous glyph was wide, clear/unlock the old trailing cell.
+	if old.width == 2 && x+1 < s.width {
+		j := i + 1
+		clear := s.cells[j]
+		clear.currMain = 0
+		clear.currComb = nil
+		clear.currStyle = style
+		clear.width = 0
+		clear.lock = false
+		s.cells[j] = clear
+		if !deferDraw {
+			s.drawCell(x+1, y, clear)
+		}
+	}
+
 	if !deferDraw {
-		s.drawCell(x, y, newc)
+		s.drawCell(x, y, newLead)
 	}
 }
 
@@ -960,5 +1040,9 @@ func (s *drawScreen) SetTitle(title string) {
 	}
 	s.d.SetLabel(title)
 }
+
+// NewPlan9Screen returns a Screen backed by libdraw (rio/devdraw).
+// It does not affect non-Plan9 builds and avoids changing NewScreen().
+func NewPlan9Screen() (Screen, error) { return newDrawScreen() }
 
 var _ Screen = (*drawScreen)(nil)
